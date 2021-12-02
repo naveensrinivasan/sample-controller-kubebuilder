@@ -21,6 +21,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -97,10 +98,24 @@ func (r *FooReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 			Namespace: req.Namespace,
 		},
 	}
+	// define service template using deploymentName
+	service := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deploymentName,
+			Namespace: req.Namespace,
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Name: "http",
+					Port: 80,
+				},
+			},
+		},
+	}
 
 	// Create or Update deployment object
 	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, deploy, func() error {
-
 		// set the replicas from foo.Spec
 		replicas := int32(1)
 		if foo.Spec.Replicas != nil {
@@ -145,11 +160,38 @@ func (r *FooReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 		// end of ctrl.CreateOrUpdate
 		return nil
-
 	}); err != nil {
 
 		// error handling of ctrl.CreateOrUpdate
 		log.Error(err, "unable to ensure deployment is correct")
+		return ctrl.Result{}, err
+
+	}
+	// Create or Update deployment object
+	if _, err := ctrl.CreateOrUpdate(ctx, r.Client, service, func() error {
+		// set a label for our deployment
+		labels := map[string]string{
+			"app":        "nginx",
+			"controller": req.Name,
+		}
+
+		// set labels to spec.selector for our deployment
+		if service.Spec.Selector == nil {
+			service.Spec.Selector = labels
+		}
+
+		// set the owner so that garbage collection can kicks in
+		if err := ctrl.SetControllerReference(&foo, service, r.Scheme); err != nil {
+			log.Error(err, "unable to set ownerReference from Foo to Deployment")
+			return err
+		}
+
+		// end of ctrl.CreateOrUpdate
+		return nil
+	}); err != nil {
+
+		// error handling of ctrl.CreateOrUpdate
+		log.Error(err, "unable to ensure service is correct")
 		return ctrl.Result{}, err
 
 	}
@@ -164,7 +206,7 @@ func (r *FooReconciler) Reconcile(req ctrl.Request) (ctrl.Result, error) {
 
 	// get deployment object from in-memory-cache
 	var deployment appsv1.Deployment
-	var deploymentNamespacedName = client.ObjectKey{Namespace: req.Namespace, Name: foo.Spec.DeploymentName}
+	deploymentNamespacedName := client.ObjectKey{Namespace: req.Namespace, Name: foo.Spec.DeploymentName}
 	if err := r.Get(ctx, deploymentNamespacedName, &deployment); err != nil {
 		log.Error(err, "unable to fetch Deployment")
 		// we'll ignore not-found errors, since they can't be fixed by an immediate
@@ -224,6 +266,26 @@ func (r *FooReconciler) cleanupOwnedResources(ctx context.Context, log logr.Logg
 		r.Recorder.Eventf(foo, corev1.EventTypeNormal, "Deleted", "Deleted deployment %q", deployment.Name)
 	}
 
+	// List all deployment resources owned by this Foo
+	var service v1.ServiceList
+	if err := r.List(ctx, &service, client.InNamespace(foo.Namespace), client.MatchingFields(map[string]string{deploymentOwnerKey: foo.Name})); err != nil {
+		return nil
+	}
+
+	// Delete service  if the service  name doesn't match foo.spec.deploymentName
+	for _, s := range service.Items {
+		if s.Name == foo.Spec.DeploymentName {
+			// If this service's name matches the one on the Foo resource
+			// then do not delete it.
+			continue
+		}
+
+		// Delete old deployment object which doesn't match foo.spec.deploymentName
+		if err := r.Delete(ctx, &service); err != nil {
+			log.Error(err, "failed to delete Deployment resource")
+			return err
+		}
+	}
 	return nil
 }
 
@@ -234,7 +296,6 @@ var (
 
 // setup with controller manager
 func (r *FooReconciler) SetupWithManager(mgr ctrl.Manager) error {
-
 	// add deploymentOwnerKey index to deployment object which foo resource owns
 	if err := mgr.GetFieldIndexer().IndexField(&appsv1.Deployment{}, deploymentOwnerKey, func(rawObj runtime.Object) []string {
 		// grab the deployment object, extract the owner...
